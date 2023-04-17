@@ -1,0 +1,142 @@
+# ansible-galaxy collection install community.okd
+# ansible-galaxy collection install azure.azcollection
+# ansible-galaxy collection install kubernetes.core
+
+- hosts: localhost
+  tasks:
+  - block:
+    # - name: Log in (obtain access token)
+    #   community.okd.openshift_auth:
+    #     username: kubeadmin
+    #     password: password
+    #   register: openshift_auth_results
+
+    - name: Create the GitOps Operator
+      kubernetes.core.k8s:
+        state: present
+        src: gitops-operator.yaml
+    
+    - name: Create the Pipelines Operator
+      kubernetes.core.k8s:
+        state: present
+        src: pipelines-operator.yaml
+
+    - name: Wait untill the Route is created
+      kubernetes.core.k8s_info:
+        kind: Route
+        wait: yes
+        name: openshift-gitops-server
+        namespace: openshift-gitops
+        wait_sleep: 10
+        wait_timeout: 360
+
+    - name: Wait untill the Secret is created
+      kubernetes.core.k8s_info:
+        kind: Secret
+        wait: yes
+        name: openshift-gitops-cluster
+        namespace: openshift-gitops
+        wait_sleep: 10
+        wait_timeout: 360
+
+    - name: Create the CICD Repository Secret
+      kubernetes.core.k8s:
+        state: present
+        src: reposecret.yaml
+
+    - name: Apply ArgoCD Configuration
+      k8s:
+        definition: "{{ lookup('kubernetes.core.kustomize', dir='../gitops/config/argocd') }}"
+
+    - name: Wait untill the CICD Namespace is created
+      kubernetes.core.k8s_info:
+        kind: Project
+        api_version: project.openshift.io/v1
+        wait: yes
+        name: cicd
+        wait_sleep: 10
+        wait_timeout: 360
+
+    - name: Wait untill the Dev Namespace is created
+      kubernetes.core.k8s_info:
+        kind: Project
+        api_version: project.openshift.io/v1
+        wait: yes
+        name: dev
+        wait_sleep: 10
+        wait_timeout: 360
+
+    - name: Create a CICD Secrets
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ item }}"
+      loop: 
+        - "{{ lookup('file', 'secrets/docker-config.yaml') }}"
+        - "{{ lookup('file', 'secrets/git-host-access-token.yaml') }}"
+        - "{{ lookup('file', 'secrets/git-host-basic-auth-token.yaml') }}"
+        - "{{ lookup('file', 'secrets/gitops-webhook-secret.yaml') }}"
+        - "{{ lookup('file', 'secrets/webhook-secret-dev-taxi.yaml') }}"
+
+    - name: Wait untill the GitOps Webhook Route is created
+      kubernetes.core.k8s_info:
+        kind: Route
+        wait: yes
+        name: gitops-webhook-event-listener-route
+        namespace: cicd
+        wait_sleep: 10
+        wait_timeout: 360
+
+    - name: Configure the Taxi Application Repository Webhooks
+      ansible.builtin.shell: |
+        GITLAB_ACCESS_TOKEN=glpat-RrCbvtXmVz56nxVdyizu
+
+        kam webhook create \
+            --git-host-access-token $GITLAB_ACCESS_TOKEN \
+            --env-name dev \
+            --service-name taxi 
+        if [ $? -ne 0 ];
+        then
+            echo "Resetting Taxi webhook"
+            kam webhook delete \
+                --git-host-access-token $GITLAB_ACCESS_TOKEN \
+                --env-name dev \
+                --service-name taxi
+            kam webhook create \
+                --git-host-access-token $GITLAB_ACCESS_TOKEN \
+                --env-name dev \
+                --service-name taxi ;
+        fi
+      args:
+        chdir: ../gitops
+        executable: /bin/bash
+
+    - name: Configure the CICD Repository Webhooks
+      ansible.builtin.shell: |
+        GITLAB_ACCESS_TOKEN=glpat-RrCbvtXmVz56nxVdyizu
+
+        kam webhook create \
+            --git-host-access-token $GITLAB_ACCESS_TOKEN \
+            --cicd
+        if [ $? -ne 0 ];
+        then
+            echo "Resetting CICD webhook"
+            kam webhook delete \
+                --git-host-access-token $GITLAB_ACCESS_TOKEN \
+                --cicd
+            kam webhook create \
+                --git-host-access-token $GITLAB_ACCESS_TOKEN \
+                --cicd
+        fi
+      args:
+        chdir: ../gitops
+        executable: /bin/bash
+
+    # always:
+    # - name: Logout
+    #   when: openshift_auth_results.openshift_auth.api_key is defined
+    #   community.okd.openshift_auth:
+    #     state: absent
+    #     api_key: "{{ openshift_auth_results.openshift_auth.api_key }}"
+
+
+    # Execution environments
